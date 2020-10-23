@@ -4,9 +4,157 @@ const aws = require('aws-sdk');
 const yaml = require('yaml');
 const fs = require('fs');
 const crypto = require('crypto');
+const axios = require('axios');
 
 const MAX_WAIT_MINUTES = 360;  // 6 hours
 const WAIT_DEFAULT_DELAY_SEC = 15;
+
+// These codes are extracted from https://github.com/aws-actions/amazon-ecs-deploy-task-definition
+// And modified for use another tasks like "notify to slack"
+
+// Notify to Slack channel with http POST request
+function notifySlack(data){
+  axios({
+    method: "POST",
+    data,
+    header: {
+      "Content-type": "application/json"
+    }
+  })
+}
+
+// Get Slack variables from inputs and return slack variables object
+function getSlackInputs() {
+  const slackWebHookUrl = core.getInput('slack-webhook-url', { required : false });
+  const slackWaitingMsgBlocksPath = core.getInput('slack-waiting-msg-blocks', { required : false });
+  const slackSuccessMsgBlocksPath = core.getInput('slack-success-msg-blocks', { required : false });
+  const slackFailureMsgBlocksPath = core.getInput('slack-failure-msg-blocks', { required : false });
+  const slackChannel = core.getInput('slack-channel', { required : false });
+  const slackDisplayText = core.getInput('slack-display-text', { required : false });
+  let slackDefaultBlocksLanguage = core.getInput('slack-default-blocks-language', { required : false });
+  slackDefaultBlocksLanguage = slackDefaultBlocksLanguage || "eng"
+  let blocksObjs = {};
+  if(slackWaitingMsgBlocksPath && slackSuccessMsgBlocksPath && slackFailureMsgBlocksPath){
+    blocksObjs = makeBlocksToObject(slackWaitingMsgBlocksPath, slackSuccessMsgBlocksPath, slackFailureMsgBlocksPath);
+  }
+
+  const slackVariables = {
+    slackWebHookUrl,
+    slackChannel,
+    slackDisplayText,
+    ...blocksObjs
+  };
+  return slackVariables;
+}
+
+// Get Slack message blocks from filepath
+function makeBlocksToObject(slackWaitingMsgBlocksPath, slackSuccessMsgBlocksPath, slackFailureMsgBlocksPath){
+  const blocksObjs = {
+    slackWaitingMsgBlocks = stringToObject(jsonFileToString(slackWaitingMsgBlocksPath)),
+    slackSuccessMsgBlocks = stringToObject(jsonFileToString(slackSuccessMsgBlocksPath)),
+    slackFailureMsgBlocks = stringToObject(jsonFileToString(slackFailureMsgBlocksPath)),
+  };
+  return blocksObjs;
+}
+
+function jsonFileToString(filePath){
+  try{
+    return fs.readFileSync(filePath, 'utf8');
+  }catch{
+    throw Error(`${filePath} does not exist!`)
+  }
+}
+
+function stringToObject(valueKey, stringValue){
+  try{
+    return JSON.parse(stringValue);
+  }catch{
+    throw Error(`your ${valueKey} is not JSON format!`)
+  }
+}
+
+// Check Slack Webhook Url is given
+function isSlackAvailable(slackObj){
+  return slackObj.slackWebHookUrl || false;
+}
+
+// Check that user want to use default block template
+function isDefaultBlock(slackObj){
+  const isDefault = slackObj.slackWaitingMsgBlocks && slackObj.slackSuccessMsgBlocks && slackObj.slackFailureMsgBlocks
+  return isDefault ? true : false;
+}
+
+// Make default block template with selected langauge
+function slackDefaultBlockTemplate(slackObj, params = {header: "", buttonText: "", buttonUrl: ""}) {
+  const lang = slackObj.slackDefaultBlocksLanguage
+  //TODO: make eng template
+  return [
+  {
+    "type": "section",
+    "text": {
+      "type": "mrkdwn",
+      "text": `저장소 : ${process.env.GITHUB_REPOSITORY}\n브랜치 : ${process.env.GITHUB_REF}\n이벤트 : ${process.env.GITHUB_EVENT_NAME}\n커밋 : ${process.env.GITHUB_SHA}`
+    }
+  },
+  {
+    "type": "header",
+    "text": {
+      "type": "plain_text",
+      "text": params.header,
+      "emoji": true
+    }
+  },
+  {
+    "type": "actions",
+    "elements": [
+      {
+        "type": "button",
+        "text": {
+          "type": "plain_text",
+          "text": params.buttonText,
+          "emoji": true
+        },
+        "url": params.buttonUrl
+      },
+      {
+        "type": "button",
+        "text": {
+          "type": "plain_text",
+          "text": "커밋정보",
+          "emoji": true
+        },
+        "url": `https://github.com/${process.env.GITHUB_REPOSITORY}/commit/${process.env.GITHUB_SHA}`
+      }
+    ]
+  }
+]}
+
+// Notify to Slack when Deploy Begin
+function notifyDeployStart(slackValues, buttonUrl){
+  if(isDefaultBlock(slackValues)){
+    notifySlack(slackDefaultBlockTemplate(slackValues, {header: "배포 시작...", buttonText: "배포상태", buttonUrl:buttonUrl}));
+  }else{
+    notifySlack(slackValues.slackWaitingMsgBlocks)
+  }
+}
+
+// Notify to Slack when Deploy Success
+function notifyDeploySuccess(slackValues, buttonUrl){
+  if(isDefaultBlock(slackValues)){
+    notifySlack(slackDefaultBlockTemplate(slackValues, {header: "배포 완료!!", buttonText: "확인", buttonUrl:buttonUrl}));
+  }else{
+    notifySlack(slackValues.slackSuccessMsgBlocks)
+  }
+}
+
+// Notify to Slack when Deploy Failure
+function notifyDeployFailure(slackValues, buttonUrl){
+  if(isDefaultBlock(slackValues)){
+    notifySlack(slackDefaultBlockTemplate(slackValues, {header: "배포 실패!!", buttonText: "확인", buttonUrl:buttonUrl}));
+  }else{
+    notifySlack(slackValues.slackFailureMsgBlocks)
+  }
+}
 
 // Attributes that are returned by DescribeTaskDefinition, but are not valid RegisterTaskDefinition inputs
 const IGNORED_TASK_DEFINITION_ATTRIBUTES = [
@@ -26,6 +174,11 @@ async function updateEcsService(ecs, clusterName, service, taskDefArn, waitForSe
     taskDefinition: taskDefArn
   }).promise();
   core.info(`Deployment started. Watch this deployment's progress in the Amazon ECS console: https://console.aws.amazon.com/ecs/home?region=${aws.config.region}#/clusters/${clusterName}/services/${service}/events`);
+  const slackValues = getSlackInputs();
+  if(isSlackAvailable(slackValues)){
+    const buttonUrl = `https://console.aws.amazon.com/ecs/home?region=${aws.config.region}#/clusters/${clusterName}/services/${service}/events`
+    notifyDeployStart(slackValues, buttonUrl);
+  }
 
   // Wait for service stability
   if (waitForService && waitForService.toLowerCase() === 'true') {
@@ -178,6 +331,11 @@ async function createCodeDeployDeployment(codedeploy, clusterName, service, task
   }).promise();
   core.setOutput('codedeploy-deployment-id', createDeployResponse.deploymentId);
   core.info(`Deployment started. Watch this deployment's progress in the AWS CodeDeploy console: https://console.aws.amazon.com/codesuite/codedeploy/deployments/${createDeployResponse.deploymentId}?region=${aws.config.region}`);
+  const slackValues = getSlackInputs();
+  if(isSlackAvailable(slackValues)){
+    const buttonUrl = `https://console.aws.amazon.com/codesuite/codedeploy/deployments/${createDeployResponse.deploymentId}?region=${aws.config.region}`
+    notifyDeployStart(slackValues, buttonUrl);
+  }
 
   // Wait for deployment to complete
   if (waitForService && waitForService.toLowerCase() === 'true') {
@@ -273,10 +431,18 @@ async function run() {
     } else {
       core.debug('Service was not specified, no service updated');
     }
+    if(isSlackAvailable(slackValues)){
+      const buttonUrl = `https://github.com/${process.env.GITHUB_REPOSITORY}/commit/${process.env.GITHUB_SHA}/checks/?check_suite_id=${process.env.GITHUB_RUN_ID}`
+      notifyDeploySuccess(slackValues, buttonUrl);
+    }
   }
   catch (error) {
     core.setFailed(error.message);
     core.debug(error.stack);
+    if(isSlackAvailable(slackValues)){
+      const buttonUrl = `https://github.com/${process.env.GITHUB_REPOSITORY}/commit/${process.env.GITHUB_SHA}/checks/?check_suite_id=${process.env.GITHUB_RUN_ID}`
+      notifyDeployFailure(slackValues, buttonUrl);
+    }
   }
 }
 
