@@ -27,7 +27,7 @@
     "dependencies": {
         "@actions/core": "^1.2.6",
         "aws-sdk": "^2.774.0",
-        "axios": "^0.20.0",
+        "axios": "^1.2.4",
         "yaml": "^1.10.0"
     },
     "devDependencies": {
